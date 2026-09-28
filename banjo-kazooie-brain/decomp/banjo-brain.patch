@@ -1,0 +1,867 @@
+diff --git a/include/functions.h b/include/functions.h
+index bdc077b..99164af 100644
+--- a/include/functions.h
++++ b/include/functions.h
+@@ -483,4 +483,13 @@ void bkmemcpy64(void *dest, void *src, s32 size); // handwritten assembly code t
+ void bkmemset64(void *dest, s32 value, s32 size); // handwritten assembly code that performs an optimized 8 byte memset
+ u32 bkGetSR(void); // handwritten assembly code that replicates the __osGetSR function
+ 
++// mod: Banjo's Brain (src/core2/brain.inc)
++void brain_update(void);
++f32  brain_speedFactor(void);
++f32  brain_jumpFactor(void);
++void brain_tint(s32 color[3]);
++bool brain_viewerOpen(void);
++void brain_setViewerOpen(bool open);
++void brain_drawViewer(Gfx **gfx, Mtx **mtx, Vtx **vtx);
++
+ #endif
+diff --git a/src/core2/ba/physics.c b/src/core2/ba/physics.c
+index e5ad1f1..55b18e6 100644
+--- a/src/core2/ba/physics.c
++++ b/src/core2/ba/physics.c
+@@ -314,7 +314,7 @@ void baphysics_set_target_velocity(f32 src[3]){
+ }
+ 
+ void baphysics_set_target_horizontal_velocity(f32 arg0){
+-    baphysics_target_horizontal_velocity = arg0;
++    baphysics_target_horizontal_velocity = arg0 * brain_speedFactor(); // mod: RUN neuron
+ }
+ 
+ void baphysics_set_target_yaw(f32 arg0){
+@@ -322,6 +322,8 @@ void baphysics_set_target_yaw(f32 arg0){
+ }
+ 
+ void baphysics_set_vertical_velocity(f32 arg0){
++    if(arg0 > 0.0f)
++        arg0 *= brain_jumpFactor(); // mod: LEAP neuron
+     s_player_velocity[1] = arg0;
+ }
+ 
+diff --git a/src/core2/brain.inc b/src/core2/brain.inc
+new file mode 100644
+index 0000000..9f77fd7
+--- /dev/null
++++ b/src/core2/brain.inc
+@@ -0,0 +1,675 @@
++/*
++ * Mod: Banjo's Brain.
++ *
++ * A tiny spiking graph neural network that lives inside the game, watches how
++ * you play, nudges the game back, and slowly rewires itself. Every cartridge
++ * grows its own brain: the seed comes from the moment you first move, and the
++ * network is saved in the unused 24 bytes of the cartridge-wide save block
++ * (GlobalSave.padding), so it belongs to the copy of the game, not a save file.
++ *
++ * Network: 20 neurons on a directed graph.
++ *   8 sensory neurons  (what Banjo feels)       -> inputs from the game
++ *   6 hidden neurons   (recurrent, talk to each other)
++ *   6 motor neurons    (what the brain does)    -> outputs into the game
++ *   36 synapses: every hidden and motor neuron listens to 3 neurons.
++ *
++ * Each frame is one round of message passing over the graph (the "graph neural
++ * network" part): every synapse carries its source's spike, plus a graded echo
++ * of its recent activity, weighted by the synapse. Each neuron is a leaky
++ * integrate-and-fire unit with an adaptive threshold (the "spiking" part).
++ *
++ * Learning, like a brain:
++ *   - STDP: a synapse whose input fires just before its target fires is marked
++ *     (eligibility trace); the reverse order marks it the other way.
++ *   - Dopamine: collecting things releases reward, getting hurt releases
++ *     punishment; dopamine turns the marked synapses into weight changes.
++ *   - Evolution: after enough reward (or a few minutes of play) the brain moves
++ *     to a new generation. Some synapses are cut and regrown from new neurons
++ *     (structural plasticity) and the brain is saved.
++ *
++ * Outputs: RUN (run speed), LEAP (jump strength), WARM / COOL (Banjo's colour),
++ * VOICE (Banjo talks) and CAW (Kazooie squawks).
++ *
++ * The pause menu gets a "VIEW BRAIN" entry that shows the live network.
++ * Included at the end of bsmethods.c so it builds into the core2 overlay.
++ */
++
++#include "time.h"
++#include "core1/sns.h"
++
++extern void sns_save_global_data(void);
++
++#define BR_IN    8
++#define BR_HID   6
++#define BR_OUT   6
++#define BR_N     (BR_IN + BR_HID + BR_OUT)
++#define BR_FANIN 3
++#define BR_E     ((BR_HID + BR_OUT) * BR_FANIN)
++#define BR_SRC   (BR_IN + BR_HID)       /* synapses start at sensory or hidden neurons */
++#define BR_W_MAX 1.0f
++#define BR_W_MIN (-8.0f / 7.0f)         /* 4-bit weights: -8..7 sevenths */
++
++#define BR_GEN_REWARD  12.0f            /* reward needed for a new generation */
++#ifdef BRAIN_TEST
++#define BR_GEN_TIME    20.0f            /* test builds evolve quickly */
++#else
++#define BR_GEN_TIME    150.0f           /* ...or this many seconds of play */
++#endif
++
++enum brain_input_e { BRI_MOVE, BRI_JUMP, BRI_ATTACK, BRI_DUCK, BRI_HURT, BRI_TREAT, BRI_WET, BRI_PULSE };
++enum brain_output_e { BRO_RUN, BRO_LEAP, BRO_WARM, BRO_COOL, BRO_VOICE, BRO_CAW };
++
++static char *sBrainInputNames[BR_IN]  = {"MOVE", "JUMP", "ATTACK", "DUCK", "HURT", "TREAT", "WET", "PULSE"};
++static char *sBrainOutputNames[BR_OUT] = {"RUN", "LEAP", "WARM", "COOL", "VOICE", "CAW"};
++static char *sBrainMoods[BR_OUT + 1]   = {"RESTLESS", "BOUNCY", "HAPPY", "CALM", "CHATTY", "CHEEKY", "SLEEPY"};
++
++static struct {
++    u8  ready;
++    u8  viewer;
++    u8  countsValid;
++    u8  flash[BR_N];
++    u8  spike[BR_N];
++    s8  src[BR_E];
++    u16 gen;
++    u32 seed;
++    u32 rng;
++    f32 v[BR_N];
++    f32 thr[BR_N];
++    f32 trace[BR_N];
++    f32 rate[BR_N];
++    f32 input[BR_IN];
++    f32 w[BR_E];
++    f32 elig[BR_E];
++    f32 dopamine;
++    f32 fitness;
++    f32 genTimer;
++    f32 saveTimer;
++    f32 voiceCooldown;
++    f32 cawCooldown;
++    f32 pulsePhase;
++    f32 hurtTimer;
++    f32 treatTimer;
++    f32 evolvedTimer;
++    s32 lastHealth;
++    s32 lastNotes;
++    s32 lastJiggies;
++    s32 lastHoneycombs;
++    s32 lastTokens;
++    s32 lastEggs;
++    Vtx *vtxBuf;
++    u8  vtxSide;
++} sBrain;
++
++/* ------------------------------------------------------------------ maths */
++static u32 __brain_hash(u32 a, u32 b, u32 c){
++    u32 h = (a * 0x9E3779B1) ^ ((b + 0x7F4A7C15) * 0x85EBCA77) ^ ((c + 0x165667B1) * 0xC2B2AE3D);
++    h ^= h >> 15; h *= 0x2C1B3C6D;
++    h ^= h >> 12; h *= 0x297A2D39;
++    h ^= h >> 15;
++    return h;
++}
++
++static f32 __brain_rand(void){
++    sBrain.rng = sBrain.rng * 1664525 + 1013904223;
++    return (f32)(sBrain.rng >> 8) * (1.0f / 16777216.0f);
++}
++
++static f32 __brain_clamp(f32 x, f32 lo, f32 hi){
++    return (x < lo) ? lo : (x > hi) ? hi : x;
++}
++
++static f32 __brain_level(s32 output){
++    return __brain_clamp(sBrain.rate[BR_IN + BR_HID + output] * 5.0f, 0.0f, 1.0f);
++}
++
++/* ------------------------------------------------------------------ graph */
++static s32 __brain_edgeDst(s32 e){
++    return BR_IN + e / BR_FANIN;
++}
++
++/*
++ * Structural evolution without storing the wiring: synapse e is regrown every
++ * `period` generations (3..8, fixed per brain), so its current source is a pure
++ * function of (seed, e, the last generation it was regrown in).
++ */
++static s32 __brain_lastRewire(s32 e, s32 gen){
++    s32 period = 3 + __brain_hash(sBrain.seed, e, 77) % 6;
++    s32 phase = __brain_hash(sBrain.seed, e, 99) % period;
++    s32 last;
++
++    if(gen <= 0)
++        return 0;
++    last = gen - ((gen + phase) % period);
++    return (last < 1) ? 0 : last;
++}
++
++static s32 __brain_pickSrc(s32 e, s32 epoch){
++    s32 dst = __brain_edgeDst(e);
++    s32 s;
++
++    if(dst < BR_SRC){ /* hidden neuron: any sensory or other hidden neuron */
++        s = __brain_hash(sBrain.seed, e * 131 + 7, epoch) % (BR_SRC - 1);
++        if(s >= dst)
++            s++;
++    }
++    else{ /* motor neuron: mostly hidden neurons, sometimes a sensory shortcut */
++        s = __brain_hash(sBrain.seed, e * 131 + 7, epoch) % (BR_SRC + BR_HID);
++        if(s >= BR_SRC)
++            s = BR_IN + (s - BR_SRC);
++    }
++    return s;
++}
++
++/* ------------------------------------------------------------------ save */
++static void __brain_store(void){
++    u8 *p = gSaveData.padding;
++    s32 e, q, nib;
++
++    p[0] = sBrain.seed >> 24; p[1] = sBrain.seed >> 16; p[2] = sBrain.seed >> 8; p[3] = sBrain.seed;
++    p[4] = sBrain.gen >> 8;   p[5] = sBrain.gen;
++    for(e = 0; e < BR_E; e++){
++        q = (s32)(sBrain.w[e] * 7.0f + ((sBrain.w[e] >= 0.0f) ? 0.5f : -0.5f));
++        q = (q < -8) ? -8 : (q > 7) ? 7 : q;
++        nib = q & 0xF;
++        if(e & 1)
++            p[6 + e / 2] = (p[6 + e / 2] & 0xF0) | nib;
++        else
++            p[6 + e / 2] = (p[6 + e / 2] & 0x0F) | (nib << 4);
++    }
++}
++
++static void __brain_save(void){
++    __brain_store();
++    sns_save_global_data();
++    sBrain.saveTimer = 0.0f;
++}
++
++static void __brain_build(void){
++    s32 i, e;
++
++    for(e = 0; e < BR_E; e++){
++        sBrain.src[e] = __brain_pickSrc(e, __brain_lastRewire(e, sBrain.gen));
++        sBrain.elig[e] = 0.0f;
++    }
++    for(i = 0; i < BR_N; i++){
++        sBrain.v[i] = 0.0f;
++        sBrain.thr[i] = 1.0f;
++        sBrain.trace[i] = 0.0f;
++        sBrain.rate[i] = 0.0f;
++        sBrain.spike[i] = 0;
++        sBrain.flash[i] = 0;
++    }
++    sBrain.rng = sBrain.seed ^ (sBrain.gen * 0x5BD1E995) ^ osGetCount();
++    sBrain.ready = TRUE;
++}
++
++/* Load the brain from the save block, or grow a new one the first time Banjo moves. */
++static void __brain_boot(void){
++    u8 *p = gSaveData.padding;
++    s32 e, nib;
++
++    sBrain.seed = (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
++    if(sBrain.seed == 0){
++        /* a new cartridge: the exact CPU cycle of your first input seeds the brain */
++        if(!(bakey_pressed(BUTTON_A) || bakey_pressed(BUTTON_B) || bakey_pressed(BUTTON_Z) || bastick_distance() > 0.2f))
++            return;
++        sBrain.seed = osGetCount() ^ (globalTimer_getTime() * 0x9E3779B1);
++        if(sBrain.seed == 0)
++            sBrain.seed = 1;
++        sBrain.gen = 0;
++        __brain_build();
++        for(e = 0; e < BR_E; e++){
++            sBrain.w[e] = (__brain_hash(sBrain.seed, e, 5) & 0xFFFF) * (1.5f / 65536.0f) - 0.5f;
++        }
++        __brain_save();
++        return;
++    }
++    sBrain.gen = (p[4] << 8) | p[5];
++    __brain_build();
++    for(e = 0; e < BR_E; e++){
++        nib = (e & 1) ? (p[6 + e / 2] & 0xF) : (p[6 + e / 2] >> 4);
++        if(nib & 8)
++            nib -= 16;
++        sBrain.w[e] = nib / 7.0f;
++    }
++}
++
++/* ------------------------------------------------------------------ dynamics */
++static void __brain_step(s32 learn){
++    u8 fired[BR_N];
++    f32 current[BR_N];
++    f32 stdp;
++    s32 i, e, pre, post;
++
++    /* sensory neurons are driven by the game */
++    for(i = 0; i < BR_IN; i++)
++        current[i] = sBrain.input[i] * 0.55f + __brain_rand() * 0.04f;
++    for(i = BR_IN; i < BR_N; i++)
++        current[i] = __brain_rand() * 0.18f; /* spontaneous activity */
++
++    /* one round of message passing over the synapse graph */
++    for(e = 0; e < BR_E; e++){
++        pre = sBrain.src[e];
++        post = __brain_edgeDst(e);
++        current[post] += sBrain.w[e] * (sBrain.spike[pre] * 2.2f + sBrain.trace[pre] * 0.35f);
++    }
++
++    /* leaky integrate-and-fire with adaptive thresholds (homeostasis) */
++    for(i = 0; i < BR_N; i++){
++        sBrain.v[i] = sBrain.v[i] * 0.88f + current[i];
++        if(sBrain.v[i] < -1.0f)
++            sBrain.v[i] = -1.0f;
++        fired[i] = (sBrain.v[i] >= sBrain.thr[i]);
++        if(fired[i]){
++            sBrain.v[i] = 0.0f;
++            sBrain.thr[i] += 0.08f;
++            sBrain.flash[i] = 6;
++        }
++        sBrain.thr[i] += (1.0f - sBrain.thr[i]) * 0.01f;
++    }
++
++    /* spike-timing-dependent plasticity, gated by dopamine */
++    if(learn){
++        for(e = 0; e < BR_E; e++){
++            pre = sBrain.src[e];
++            post = __brain_edgeDst(e);
++            stdp = fired[post] * sBrain.trace[pre] - fired[pre] * sBrain.trace[post] * 1.05f;
++            sBrain.elig[e] = sBrain.elig[e] * 0.96f + stdp;
++            sBrain.w[e] = __brain_clamp(sBrain.w[e] + 0.03f * sBrain.dopamine * sBrain.elig[e] + 0.002f * stdp, BR_W_MIN, BR_W_MAX);
++        }
++    }
++
++    for(i = 0; i < BR_N; i++){
++        sBrain.trace[i] = sBrain.trace[i] * 0.8f + fired[i];
++        sBrain.rate[i] = sBrain.rate[i] * 0.96f + fired[i] * 0.04f;
++        sBrain.spike[i] = fired[i];
++        if(sBrain.flash[i])
++            sBrain.flash[i]--;
++    }
++    sBrain.dopamine *= 0.97f;
++}
++
++static void __brain_evolve(void){
++    s32 e;
++
++    sBrain.gen++;
++    for(e = 0; e < BR_E; e++){
++        if(__brain_lastRewire(e, sBrain.gen) == sBrain.gen){
++            /* prune this synapse and grow a new one from another neuron */
++            sBrain.src[e] = __brain_pickSrc(e, sBrain.gen);
++            sBrain.w[e] = __brain_rand() * 0.8f - 0.3f;
++            sBrain.elig[e] = 0.0f;
++        }
++    }
++    sBrain.fitness = 0.0f;
++    sBrain.genTimer = 0.0f;
++    sBrain.evolvedTimer = 2.5f;
++    __brain_save();
++}
++
++static s32 __brain_countUp(s32 now, s32 *last){
++    s32 gained = now - *last;
++    *last = now;
++    /* big jumps are the game setting counters (new file, new level), not treats */
++    return (gained > 0 && gained <= 5) ? gained : 0;
++}
++
++/* Called every frame from the player update (func_80295C14), while you have control. */
++void brain_update(void){
++    f32 dt = time_getDelta();
++    f32 reward = 0.0f;
++    s32 health;
++    s32 pick;
++
++    if(!sBrain.ready){
++        __brain_boot();
++        if(!sBrain.ready)
++            return;
++    }
++
++    /* senses */
++    health = item_getCount(ITEM_14_HEALTH);
++    if(sBrain.countsValid){
++        reward += 0.4f * __brain_countUp(item_getCount(ITEM_C_NOTE), &sBrain.lastNotes);
++        reward += 3.0f * __brain_countUp(item_getCount(ITEM_E_JIGGY), &sBrain.lastJiggies);
++        reward += 1.0f * __brain_countUp(item_getCount(ITEM_13_EMPTY_HONEYCOMB), &sBrain.lastHoneycombs);
++        reward += 1.0f * __brain_countUp(item_getCount(ITEM_1C_MUMBO_TOKEN), &sBrain.lastTokens);
++        reward += 0.2f * __brain_countUp(item_getCount(ITEM_D_EGGS), &sBrain.lastEggs);
++        if(health < sBrain.lastHealth){
++            sBrain.hurtTimer = 0.5f;
++            sBrain.dopamine -= 1.2f;
++        }
++    }
++    else{
++        sBrain.lastNotes = item_getCount(ITEM_C_NOTE);
++        sBrain.lastJiggies = item_getCount(ITEM_E_JIGGY);
++        sBrain.lastHoneycombs = item_getCount(ITEM_13_EMPTY_HONEYCOMB);
++        sBrain.lastTokens = item_getCount(ITEM_1C_MUMBO_TOKEN);
++        sBrain.lastEggs = item_getCount(ITEM_D_EGGS);
++        sBrain.countsValid = TRUE;
++    }
++    sBrain.lastHealth = health;
++    if(reward > 0.0f){
++        sBrain.treatTimer = 0.4f;
++        sBrain.dopamine += reward;
++        sBrain.fitness += reward;
++    }
++    sBrain.dopamine = __brain_clamp(sBrain.dopamine, -2.0f, 2.0f);
++    sBrain.hurtTimer -= dt;
++    sBrain.treatTimer -= dt;
++    sBrain.pulsePhase += dt * 1.3f;
++    if(sBrain.pulsePhase >= 1.0f)
++        sBrain.pulsePhase -= 1.0f;
++
++    sBrain.input[BRI_MOVE]   = bastick_distance();
++    sBrain.input[BRI_JUMP]   = bakey_pressed(BUTTON_A) ? 3.0f : 0.0f;
++    sBrain.input[BRI_ATTACK] = bakey_pressed(BUTTON_B) ? 3.0f : 0.0f;
++    sBrain.input[BRI_DUCK]   = bakey_held(BUTTON_Z) ? 0.8f : 0.0f;
++    sBrain.input[BRI_HURT]   = (sBrain.hurtTimer > 0.0f) ? 2.5f : 0.0f;
++    sBrain.input[BRI_TREAT]  = (sBrain.treatTimer > 0.0f) ? 2.5f : 0.0f;
++    sBrain.input[BRI_WET]    = player_inWater() ? 0.8f : 0.0f;
++    sBrain.input[BRI_PULSE]  = (sBrain.pulsePhase < 0.12f) ? 2.5f : 0.0f;
++
++    __brain_step(TRUE);
++
++    /* motor neurons that act right away: Banjo and Kazooie speak their mind */
++    sBrain.voiceCooldown -= dt;
++    sBrain.cawCooldown -= dt;
++    if(sBrain.spike[BR_IN + BR_HID + BRO_VOICE] && __brain_level(BRO_VOICE) > 0.35f && sBrain.voiceCooldown <= 0.0f){
++        static enum sfx_e voices[4] = {SFX_33_BANJO_AHOO, SFX_4F_BANJO_WAHOO, SFX_56_BANJO_HUI, SFX_6F_BANJO_HEADSCRATCH};
++        pick = __brain_hash(sBrain.seed, sBrain.gen, 3) % 4; /* each brain has its favourite line */
++        func_8030E58C(voices[pick], 0.95f + __brain_rand() * 0.15f);
++        sBrain.voiceCooldown = 15.0f + __brain_rand() * 25.0f;
++    }
++    if(sBrain.spike[BR_IN + BR_HID + BRO_CAW] && __brain_level(BRO_CAW) > 0.35f && sBrain.cawCooldown <= 0.0f){
++        static enum sfx_e caws[4] = {SFX_42_KAZOOIE_RAH, SFX_49_KAZOOIE_RA, SFX_4E_KAZOOIE_BRUIII, SFX_8B_KAZOOIE_RAWW};
++        pick = __brain_hash(sBrain.seed, sBrain.gen, 4) % 4;
++        func_8030E58C(caws[pick], 0.95f + __brain_rand() * 0.15f);
++        sBrain.cawCooldown = 15.0f + __brain_rand() * 25.0f;
++    }
++
++    /* evolution */
++    sBrain.genTimer += dt;
++    sBrain.saveTimer += dt;
++    if(sBrain.fitness >= BR_GEN_REWARD || sBrain.genTimer >= BR_GEN_TIME){
++        __brain_evolve();
++    }
++    else if(sBrain.saveTimer >= 90.0f){
++        __brain_save(); /* keep what it has learned */
++    }
++
++#ifdef BRAIN_TEST
++    {
++        static char dbg[32];
++        bk_strcpy(dbg, "G ");
++        bk_strIToA(dbg + bk_strlen(dbg), sBrain.gen);
++        bk_strcat(dbg, " T ");
++        bk_strIToA(dbg + bk_strlen(dbg), (s32)sBrain.genTimer);
++        bk_strcat(dbg, " F ");
++        bk_strIToA(dbg + bk_strlen(dbg), (s32)sBrain.fitness);
++        print_dialog(20, 220, dbg);
++    }
++#endif
++    if(sBrain.evolvedTimer > 0.0f){
++        static char msg[32];
++        sBrain.evolvedTimer -= dt;
++        bk_strcpy(msg, "BRAIN EVOLVED  GEN ");
++        bk_strIToA(msg + bk_strlen(msg), sBrain.gen);
++        print_dialog(74, 42, msg);
++    }
++}
++
++/* ------------------------------------------------------------------ outputs */
++f32 brain_speedFactor(void){
++    return sBrain.ready ? 0.94f + 0.16f * __brain_level(BRO_RUN) : 1.0f;
++}
++
++f32 brain_jumpFactor(void){
++    return sBrain.ready ? 0.98f + 0.08f * __brain_level(BRO_LEAP) : 1.0f;
++}
++
++void brain_tint(s32 color[3]){
++    f32 warm, cool;
++
++    if(!sBrain.ready)
++        return;
++    warm = __brain_level(BRO_WARM);
++    cool = __brain_level(BRO_COOL);
++    color[0] = (s32)(color[0] * (1.0f - 0.30f * cool));
++    color[1] = (s32)(color[1] * (1.0f - 0.12f * (warm + cool)));
++    color[2] = (s32)(color[2] * (1.0f - 0.30f * warm));
++}
++
++/* ------------------------------------------------------------------ viewer */
++#define BRV_MAX 320
++
++bool brain_viewerOpen(void){
++    return sBrain.viewer;
++}
++
++void brain_setViewerOpen(bool open){
++    if(open){
++        /* allocated once and kept: the RSP may still be reading last frame's vertices after closing */
++        if(sBrain.vtxBuf == NULL)
++            sBrain.vtxBuf = (Vtx *)bk_malloc(2 * BRV_MAX * sizeof(Vtx));
++        sBrain.viewer = (sBrain.vtxBuf != NULL);
++    }
++    else{
++        sBrain.viewer = FALSE;
++    }
++}
++
++static void __brain_nodePos(s32 i, f32 *x, f32 *y){
++    if(i < BR_IN){
++        *x = 78.0f;
++        *y = 62.0f + i * 20.0f;
++    }
++    else if(i < BR_SRC){
++        f32 a = (i - BR_IN) * (6.2831853f / BR_HID) + 0.5f;
++        *x = 160.0f + cosf(a) * 42.0f;
++        *y = 131.0f + sinf(a) * 42.0f;
++    }
++    else{
++        *x = 240.0f;
++        *y = 72.0f + (i - BR_SRC) * 25.0f;
++    }
++}
++
++typedef struct {
++    Gfx **gfx;
++    Vtx *base;
++    Vtx *batch;
++    s32 used;
++    s32 inBatch;
++} BrainQuads;
++
++static void __brain_flush(BrainQuads *q){
++    s32 k;
++    if(q->inBatch == 0)
++        return;
++    gSPVertex((*q->gfx)++, osVirtualToPhysical(q->batch), q->inBatch * 4, 0);
++    for(k = 0; k < q->inBatch; k++){
++        gSP2Triangles((*q->gfx)++, k*4, k*4 + 1, k*4 + 2, 0, k*4, k*4 + 2, k*4 + 3, 0);
++    }
++    q->batch += q->inBatch * 4;
++    q->inBatch = 0;
++}
++
++static void __brain_quad(BrainQuads *q, f32 p[4][2], u8 r, u8 g, u8 b, u8 a){
++    Vtx *v;
++    s32 k;
++
++    if(q->used + 4 > BRV_MAX)
++        return;
++    v = q->batch + q->inBatch * 4;
++    for(k = 0; k < 4; k++){
++        v[k].v.ob[0] = (s16)((p[k][0] - gFramebufferWidth * 0.5f) * 4.0f);
++        v[k].v.ob[1] = (s16)((gFramebufferHeight * 0.5f - p[k][1]) * 4.0f);
++        v[k].v.ob[2] = -5;
++        v[k].v.flag = 0;
++        v[k].v.tc[0] = v[k].v.tc[1] = 0;
++        v[k].v.cn[0] = r; v[k].v.cn[1] = g; v[k].v.cn[2] = b; v[k].v.cn[3] = a;
++    }
++    q->used += 4;
++    if(++q->inBatch == 8)
++        __brain_flush(q);
++}
++
++static void __brain_rect(BrainQuads *q, f32 x0, f32 y0, f32 x1, f32 y1, u8 r, u8 g, u8 b, u8 a){
++    f32 p[4][2];
++    p[0][0] = x0; p[0][1] = y0;
++    p[1][0] = x0; p[1][1] = y1;
++    p[2][0] = x1; p[2][1] = y1;
++    p[3][0] = x1; p[3][1] = y0;
++    __brain_quad(q, p, r, g, b, a);
++}
++
++static void __brain_line(BrainQuads *q, f32 x0, f32 y0, f32 x1, f32 y1, f32 width, u8 r, u8 g, u8 b, u8 a){
++    f32 p[4][2];
++    f32 nx = -(y1 - y0), ny = x1 - x0;
++    f32 len = sqrtf(nx * nx + ny * ny);
++    if(len < 0.5f)
++        return;
++    nx = nx / len * width * 0.5f;
++    ny = ny / len * width * 0.5f;
++    p[0][0] = x0 - nx; p[0][1] = y0 - ny;
++    p[1][0] = x0 + nx; p[1][1] = y0 + ny;
++    p[2][0] = x1 + nx; p[2][1] = y1 + ny;
++    p[3][0] = x1 - nx; p[3][1] = y1 - ny;
++    __brain_quad(q, p, r, g, b, a);
++}
++
++static void __brain_hex(char *dst, u32 value){
++    static char digits[] = "0123456789ABCDEF";
++    s32 k;
++    for(k = 0; k < 8; k++)
++        dst[k] = digits[(value >> (28 - 4 * k)) & 0xF];
++    dst[8] = 0;
++}
++
++/* Drawn over the pause screen while "VIEW BRAIN" is open. The game is frozen, so the
++ * brain keeps "dreaming" here: it runs on its own rhythm, without learning. */
++void brain_drawViewer(Gfx **gfx, Mtx **mtx, Vtx **vtx){
++    static char line1[32], mood[32];
++    BrainQuads q;
++    f32 x0, y0, x1, y1, a, lvl, best;
++    s32 i, e, pre, post, top;
++    u8 r, g, b;
++
++    if(!sBrain.viewer)
++        return;
++
++    print_clearPrintBufferStrings(); /* hide the HUD counters queued this frame */
++
++    if(sBrain.ready){
++        for(i = 0; i < BR_IN; i++)
++            sBrain.input[i] *= 0.9f;
++        sBrain.pulsePhase += 1.0f / 30.0f;
++        if(sBrain.pulsePhase >= 1.0f)
++            sBrain.pulsePhase -= 1.0f;
++        sBrain.input[BRI_PULSE] = (sBrain.pulsePhase < 0.12f) ? 2.5f : 0.0f;
++        __brain_step(FALSE);
++    }
++
++    sBrain.vtxSide ^= 1;
++    q.gfx = gfx;
++    q.base = q.batch = sBrain.vtxBuf + sBrain.vtxSide * BRV_MAX;
++    q.used = 0;
++    q.inBatch = 0;
++
++    viewport_setRenderViewportAndOrthoMatrix(gfx, mtx);
++    gDPPipeSync((*gfx)++);
++    gSPClearGeometryMode((*gfx)++, G_ZBUFFER | G_CULL_BOTH | G_FOG | G_LIGHTING | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR | G_LOD);
++    gSPSetGeometryMode((*gfx)++, G_SHADE | G_SHADING_SMOOTH);
++    gSPTexture((*gfx)++, 0, 0, 0, G_TX_RENDERTILE, G_OFF);
++    gDPSetCycleType((*gfx)++, G_CYC_1CYCLE);
++    gDPSetCombineMode((*gfx)++, G_CC_SHADE, G_CC_SHADE);
++    gDPSetRenderMode((*gfx)++, G_RM_XLU_SURF, G_RM_XLU_SURF2);
++
++    /* backdrop */
++    __brain_rect(&q, 0.0f, 0.0f, gFramebufferWidth, gFramebufferHeight, 0x06, 0x04, 0x14, 0xFF);
++    __brain_rect(&q, 118.0f, 89.0f, 202.0f, 173.0f, 0x20, 0x10, 0x40, 0x50);
++
++    if(!sBrain.ready){
++        __brain_flush(&q);
++        print_dialog(82, 120, "MOVE TO WAKE ME UP");
++    }
++    else{
++        /* synapses: green excite, red inhibit; they light up when a spike travels along them */
++        for(e = 0; e < BR_E; e++){
++            pre = sBrain.src[e];
++            post = __brain_edgeDst(e);
++            __brain_nodePos(pre, &x0, &y0);
++            __brain_nodePos(post, &x1, &y1);
++            a = (sBrain.w[e] >= 0.0f) ? sBrain.w[e] : -sBrain.w[e];
++            if(sBrain.w[e] >= 0.0f){ r = 0x30; g = 0xE0; b = 0x80; }
++            else                   { r = 0xFF; g = 0x30; b = 0x50; }
++            if(sBrain.flash[pre] > 3){ r = 0xFF; g = 0xFF; b = 0xC0; }
++            __brain_line(&q, x0, y0, x1, y1, 1.0f + a * 2.0f, r, g, b, (u8)(50 + a * 170.0f));
++        }
++
++        /* neurons: size and brightness follow the membrane potential, white when they spike */
++        for(i = 0; i < BR_N; i++){
++            f32 s;
++            __brain_nodePos(i, &x0, &y0);
++            lvl = __brain_clamp(sBrain.v[i] / sBrain.thr[i], 0.0f, 1.0f);
++            if(i < BR_IN)       { r = 0xFF; g = 0x90; b = 0x20; }
++            else if(i < BR_SRC) { r = 0xB0; g = 0x60; b = 0xFF; }
++            else                { r = 0x30; g = 0xC0; b = 0xFF; }
++            s = 3.0f + lvl * 1.5f + sBrain.flash[i] * 0.6f;
++            if(sBrain.flash[i]){
++                r = 0xFF; g = 0xFF; b = 0xFF;
++            }
++            else{
++                r = (u8)(r * (0.45f + 0.55f * lvl));
++                g = (u8)(g * (0.45f + 0.55f * lvl));
++                b = (u8)(b * (0.45f + 0.55f * lvl));
++            }
++            __brain_rect(&q, x0 - s, y0 - s, x0 + s, y0 + s, r, g, b, 0xFF);
++        }
++
++        /* motor output meters */
++        for(i = 0; i < BR_OUT; i++){
++            __brain_nodePos(BR_SRC + i, &x0, &y0);
++            lvl = __brain_level(i);
++            __brain_rect(&q, 250.0f, y0 + 5.0f, 302.0f, y0 + 8.0f, 0x30, 0x30, 0x48, 0xFF);
++            __brain_rect(&q, 250.0f, y0 + 5.0f, 250.0f + 52.0f * lvl, y0 + 8.0f, 0x30, 0xC0, 0xFF, 0xFF);
++        }
++        __brain_flush(&q);
++
++        /* text */
++        bk_strcpy(line1, "GEN ");
++        bk_strIToA(line1 + bk_strlen(line1), sBrain.gen);
++        bk_strcat(line1, "   SEED ");
++        __brain_hex(line1 + bk_strlen(line1), sBrain.seed);
++        print_dialog(64, 34, line1);
++
++        top = BR_OUT;
++        best = 0.25f;
++        for(i = 0; i < BR_OUT; i++){
++            if(__brain_level(i) > best){
++                best = __brain_level(i);
++                top = i;
++            }
++        }
++        bk_strcpy(mood, "MOOD ");
++        bk_strcat(mood, sBrainMoods[top]);
++        print_dialog(106, 206, mood);
++        for(i = 0; i < BR_IN; i++){
++            __brain_nodePos(i, &x0, &y0);
++            print_dialog(12, (s32)y0 - 4, sBrainInputNames[i]);
++        }
++        for(i = 0; i < BR_OUT; i++){
++            __brain_nodePos(BR_SRC + i, &x0, &y0);
++            print_dialog(252, (s32)y0 - 6, sBrainOutputNames[i]);
++        }
++    }
++
++    osWritebackDCache(q.base, BRV_MAX * sizeof(Vtx));
++    gDPPipeSync((*gfx)++);
++    gSPSetGeometryMode((*gfx)++, G_ZBUFFER);
++    viewport_setRenderViewportAndPerspectiveMatrix(gfx, mtx);
++
++    print_dialog(100, 16, "BANJO'S BRAIN");
++    print_dialog(118, 224, "B  BACK");
++}
+diff --git a/src/core2/bsmethods.c b/src/core2/bsmethods.c
+index 78ff22b..df1bcae 100644
+--- a/src/core2/bsmethods.c
++++ b/src/core2/bsmethods.c
+@@ -290,6 +290,7 @@ void func_80295C14(void){
+     bastick_update();
+     bainput_update(); //dive_cooldown_update
+     bs_updateState();
++    brain_update(); // mod: Banjo's Brain senses, thinks, learns
+     baphysics_update();
+     playerPosition_applyOffset();
+     bafalldamage_update();
+@@ -332,3 +333,6 @@ void func_80295D74(void){
+         func_8029AF1C();
+     }
+ }
++
++// mod: Banjo's Brain
++#include "brain.inc"
+diff --git a/src/core2/code_12F30.c b/src/core2/code_12F30.c
+index fa1ce15..e92e45c 100644
+--- a/src/core2/code_12F30.c
++++ b/src/core2/code_12F30.c
+@@ -227,6 +227,7 @@ void core2_12F30_getPlayerTint(s32 arg0[3]){
+     arg0[0] = (s32)(sCore2_12F30PlayerTint.color[0] + 0.5);
+     arg0[1] = (s32)(sCore2_12F30PlayerTint.color[1] + 0.5);
+     arg0[2] = (s32)(sCore2_12F30PlayerTint.color[2] + 0.5);
++    brain_tint(arg0); // mod: WARM / COOL neurons
+ }
+ 
+ void core2_12F30_reset(void){
+diff --git a/src/core2/code_5C870.c b/src/core2/code_5C870.c
+index 411af64..80fe829 100644
+--- a/src/core2/code_5C870.c
++++ b/src/core2/code_5C870.c
+@@ -149,10 +149,11 @@ void func_802E39D0(Gfx **gfx, Mtx **mtx, Vtx **vtx, s32 framebuffer_idx, bool ar
+ 
+     gcdialog_draw(gfx, mtx, vtx);
+ 
+-    if (!game_is_frozen()) {
++    if (!game_is_frozen() && !brain_viewerOpen()) { // mod: no HUD over the brain viewer
+         itemPrint_draw(gfx, mtx, vtx);
+     }
+ 
++    brain_drawViewer(gfx, mtx, vtx); // mod: VIEW BRAIN, over the pause HUD
+     printbuffer_draw(gfx, mtx, vtx);
+ 
+     if ((sGameState.game_mode != GAME_MODE_A_SNS_PICTURE) || (sGameState.map_transition_style == 6) || (sGameState.map_transition_style == 5)) {
+diff --git a/src/core2/gc/pauseMenu.c b/src/core2/gc/pauseMenu.c
+index 4c9dc7f..2b88acd 100644
+--- a/src/core2/gc/pauseMenu.c
++++ b/src/core2/gc/pauseMenu.c
+@@ -202,6 +202,9 @@ char D_80383088[0x18];
+ /* public */
+ void gcpausemenu_zoombox_callback(s32, s32);
+ 
++/* mod: Banjo's Brain - extra "VIEW BRAIN" entry below SAVE AND QUIT */
++static u8 sPauseBrainSelected;
++
+ /* .code */
+ void gcpausemenu_defrag(void) {
+     s32 i;
+@@ -450,6 +453,8 @@ void gcPauseMenu_setState(enum gcpausemenu_state_e next_state) {
+             gcpausemenu_80311A84();
+             D_80383010.menu = PAUSE_MENU_0_MAIN;
+             D_80383010.left_joystick_visible = D_80383010.right_joystick_visible = D_80383010.exit_pause = D_80383010.selection = D_80383010.zoombox_opening_count = 0;
++            sPauseBrainSelected = FALSE; // mod
++            brain_setViewerOpen(FALSE);
+             break;
+ 
+         case PAUSE_STATE_1_MENU_OPENING:
+@@ -961,6 +966,38 @@ s32 gcPauseMenu_update(void) {
+             break;
+ 
+         case PAUSE_STATE_2_MENU: //open
++            // mod: Banjo's Brain viewer and menu entry
++            if (brain_viewerOpen()) {
++                if (face_button[FACE_BUTTON(BUTTON_B)] == 1 || face_button[FACE_BUTTON(BUTTON_A)] == 1 || controller_getStartButton(0) == 1) {
++                    brain_setViewerOpen(FALSE);
++                    D_80383010.unk7 = 6;
++                }
++                break;
++            }
++            if (sPauseBrainSelected) {
++                if (controller_getStartButton(0) == 1) {
++                    sPauseBrainSelected = FALSE;
++                    gcPauseMenu_setState(PAUSE_STATE_6_MENU_CLOSING);
++                }
++                else if (face_button[FACE_BUTTON(BUTTON_A)] == 1) {
++                    brain_setViewerOpen(TRUE);
++                }
++                else if (face_button[FACE_BUTTON(BUTTON_B)] == 1) {
++                    sPauseBrainSelected = FALSE;
++                    D_80383010.selection = PAUSE_SELECTION_0_RETURN_TO_GAME;
++                    gczoombox_highlight(D_80383010.zoombox[D_80383010.selection], 1);
++                    gcPauseMenu_setState(PAUSE_STATE_3_RETURNING_TO_GAME);
++                }
++                else if (D_80383010.unk7 > 0) {
++                    D_80383010.unk7--;
++                }
++                else if (0.75 < joystick[JOYSTICK_Y]) {
++                    sPauseBrainSelected = FALSE;
++                    gczoombox_highlight(D_80383010.zoombox[D_80383010.selection], TRUE);
++                    D_80383010.unk7 = 6;
++                }
++                break;
++            }
+             if (D_80383010.unk70_31 && !func_802FC3C4()) {
+                 code_73640_printItemCount(ITEM_12_JINJOS);
+                 D_80383010.unk70_31 = 0;
+@@ -1018,7 +1055,12 @@ s32 gcPauseMenu_update(void) {
+                     }
+                 }
+                 else if (joystick[JOYSTICK_Y] < -0.75) {
+-                    if ((s32) D_80383010.selection < 3) {
++                    if ((s32) D_80383010.selection == 3) { // mod: move down onto VIEW BRAIN
++                        gczoombox_highlight(D_80383010.zoombox[D_80383010.selection], 0);
++                        sPauseBrainSelected = TRUE;
++                        D_80383010.unk7 = 6;
++                    }
++                    else if ((s32) D_80383010.selection < 3) {
+                         gczoombox_highlight(D_80383010.zoombox[D_80383010.selection], 0);
+                         D_80383010.selection++;
+                         if (D_80383010.return_to_lair_disabled && D_80383010.selection == PAUSE_SELECTION_1_EXIT_TO_WITCH_S_LAIR) {
+@@ -1365,10 +1407,21 @@ void gcpausemenu_draw(Gfx **gfx, Mtx **mtx, Vtx **vtx) {
+         func_80315110(gfx, mtx, vtx);
+     }
+ 
++    if (brain_viewerOpen()) // mod: the brain viewer covers the menu
++        return;
++
+     for (i = 0; i < 4; i++) {
+         gczoombox_draw(D_80383010.zoombox[i], gfx, mtx, vtx);
+     }
+ 
++    // mod: Banjo's Brain menu entry
++    if (D_80383010.menu == PAUSE_MENU_0_MAIN && D_80383010.state == PAUSE_STATE_2_MENU) {
++        if (sPauseBrainSelected)
++            print_bold_spaced(78, 162, "VIEW BRAIN");
++        else
++            print_dialog(115, 162, "VIEW BRAIN");
++    }
++
+     gcpausemenu_drawSprite(gfx, mtx, vtx, D_80383010.joystick_sprite, D_80383010.joystick_frame, 30.0f, 196.0f, 1, (s32) D_80383010.left_joystick_alpha);
+     gcpausemenu_drawSprite(gfx, mtx, vtx, D_80383010.joystick_sprite, D_80383010.joystick_frame, (f32)(gFramebufferWidth - 0x1E), 196.0f, 0, (s32) D_80383010.right_joystick_alpha);
+     var_a0 = ((*((u32 * ) & D_80383010.state) << 0x1c) >> 0x1f); //left_joystick_visible
