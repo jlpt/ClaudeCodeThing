@@ -1,0 +1,561 @@
+diff --git a/include/bs_funcs.h b/include/bs_funcs.h
+index 6d29b42..360c3bc 100644
+--- a/include/bs_funcs.h
++++ b/include/bs_funcs.h
+@@ -270,6 +270,12 @@ void bsant_die_update(void);
+ void bsant_die_end(void);
+ //BS_44_JIG_JIGGY
+ void bsjig_jiggy_init(void);
++
++// mod: Domain Expansion - Malevolent Shrine
++void bsshrine_init(void);
++void bsshrine_update(void);
++void bsshrine_end(void);
++void bsshrine_interrupt(void);
+ void bsjig_jiggy_update(void);
+ void bsjig_jiggy_end(void);
+ void bsjig_jiggy_interrupt(void);
+diff --git a/include/enums.h b/include/enums.h
+index a6c2e9d..daf627a 100644
+--- a/include/enums.h
++++ b/include/enums.h
+@@ -2634,7 +2634,8 @@ enum bs_e {
+     BS_A2_WALRUS_BOUNCE,
+     BS_A3_BEE_BOUNCE,
+     BS_A4_WONDERWING_DRONE,
+-    BS_A5_WONDERWING_UNKA5
++    BS_A5_WONDERWING_UNKA5,
++    BS_A6_MALEVOLENT_SHRINE // mod: Domain Expansion
+ };
+ 
+ enum sm_specific_flags {
+@@ -2841,7 +2842,7 @@ enum asset_e
+     ASSET_1_ANIM_BSCROUCH_ENTER = 0x1,
+     ASSET_2_ANIM_BSWALK_CREEP,
+     ASSET_3_ANIM_BSWALK,
+-    /*stub*/ ASSET_4_ANIM_stub,
++    ASSET_4_ANIM_BSSHRINE, // mod: Malevolent Shrine hand sign
+     ASSET_5_ANIM_BSPUNCH,
+     /*stub*/ ASSET_6_ANIM_stub,
+     ASSET_7_ANIM_BSBTROT_EXIT,
+diff --git a/include/functions.h b/include/functions.h
+index bdc077b..0db9d76 100644
+--- a/include/functions.h
++++ b/include/functions.h
+@@ -483,4 +483,9 @@ void bkmemcpy64(void *dest, void *src, s32 size); // handwritten assembly code t
+ void bkmemset64(void *dest, s32 value, s32 size); // handwritten assembly code that performs an optimized 8 byte memset
+ u32 bkGetSR(void); // handwritten assembly code that replicates the __osGetSR function
+ 
++// mod: Domain Expansion - Malevolent Shrine (src/core2/bs/malevolent_shrine.inc)
++bool bsshrine_canStart(void);
++s32 bsshrine_getHitbox(void);
++void bsshrine_draw(Gfx **gfx, Mtx **mtx, Vtx **vtx);
++
+ #endif
+diff --git a/src/core2/bs/jig.c b/src/core2/bs/jig.c
+index 54a249d..d2f642d 100644
+--- a/src/core2/bs/jig.c
++++ b/src/core2/bs/jig.c
+@@ -203,3 +203,5 @@ void bsjig_notedoor_update(void){
+     bs_setState(sp1C);
+ }
+ 
++// mod: Domain Expansion - Malevolent Shrine
++#include "malevolent_shrine.inc"
+diff --git a/src/core2/bs/malevolent_shrine.inc b/src/core2/bs/malevolent_shrine.inc
+new file mode 100644
+index 0000000..c5bd412
+--- /dev/null
++++ b/src/core2/bs/malevolent_shrine.inc
+@@ -0,0 +1,388 @@
++/*
++ * Mod: "Domain Expansion: Malevolent Shrine" (Jujutsu Kaisen).
++ *
++ * Press L while standing or walking on the ground as Banjo. Banjo turns to the
++ * camera, makes the hand sign (ASSET_4_ANIM_BSSHRINE), the screen closes in
++ * with a blood-red shrine frame, and every enemy within range is slashed to
++ * pieces for a few seconds.
++ *
++ * Included at the end of bs/jig.c so it lives in the core2 overlay without
++ * changing the splat segment layout.
++ */
++
++#include "time.h"
++
++#define SHRINE_DURATION        7.0f
++#define SHRINE_TEXT1_START     0.9f
++#define SHRINE_TEXT2_START     2.0f
++#define SHRINE_TEXT_END        4.6f
++#define SHRINE_SLASH_START     2.3f
++#define SHRINE_SLASH_END       5.7f
++#define SHRINE_FADE_END        6.5f
++#define SHRINE_RADIUS          2500.0f
++#define SHRINE_MAX_SLASHES     12
++
++typedef struct {
++    f32 x0, y0, x1, y1; /* screen pixels */
++    f32 life;           /* seconds remaining */
++    f32 width;
++} ShrineSlash;
++
++/* .bss */
++static f32 sShrineTimer;
++static f32 sShrineHitTimer;
++static f32 sShrineSfxTimer;
++static f32 sShrineSlashSpawnTimer;
++static u8  sShrineActive;
++static u8  sShrineSweep;
++static s32 sShrineHitbox;
++static u8  sShrineThunderPlayed;
++static u8  sShrineNamePlayed;
++static ShrineSlash sShrineSlashes[SHRINE_MAX_SLASHES];
++
++/* .code */
++static f32 __bsshrine_clamp01(f32 v){
++    if(v < 0.0f) return 0.0f;
++    if(v > 1.0f) return 1.0f;
++    return v;
++}
++
++/* 0..1 strength of the domain's screen effect for the current timer value */
++static f32 __bsshrine_intensity(void){
++    if(!sShrineActive)
++        return 0.0f;
++    if(sShrineTimer < SHRINE_TEXT2_START)
++        return __bsshrine_clamp01(sShrineTimer / SHRINE_TEXT2_START) * 0.6f;
++    if(sShrineTimer < SHRINE_SLASH_END)
++        return 0.6f + __bsshrine_clamp01((sShrineTimer - SHRINE_TEXT2_START) / 0.3f) * 0.4f;
++    return 1.0f - __bsshrine_clamp01((sShrineTimer - SHRINE_SLASH_END) / (SHRINE_FADE_END - SHRINE_SLASH_END));
++}
++
++static int __bsshrine_canSlash(Actor *actor){
++    return !actor->unk124_0;
++}
++
++/*
++ * Most enemies take damage through the collision table, which asks which attack
++ * Banjo is doing (see hitbox_getHitboxForActor). Each sweep of the domain
++ * pretends to be a different attack so every kind of enemy gets cut by
++ * something that hurts it.
++ */
++s32 bsshrine_getHitbox(void){
++    return sShrineHitbox;
++}
++
++static void __bsshrine_sweep(void){
++    static s32 attacks[] = {
++        HITBOX_3_BEAK_BOMB, HITBOX_1_BEAK_BUSTER, HITBOX_2_BEAK_BARGE, HITBOX_7_ROLL,
++        HITBOX_4_CLAW, HITBOX_5_PECK, HITBOX_A_FAST_FALLING
++    };
++    f32 player_position[3];
++
++    playerPosition_get(player_position);
++    sShrineHitbox = attacks[sShrineSweep % (sizeof(attacks) / sizeof(attacks[0]))];
++    sShrineSweep++;
++    func_8032728C(player_position, SHRINE_RADIUS, MARKER_COLLISION_FUNC_2_DIE, __bsshrine_canSlash);
++    sShrineHitbox = HITBOX_0_NONE;
++}
++
++static void __bsshrine_spawnSlash(void){
++    ShrineSlash *s;
++    f32 cx, cy, len, ang, dx, dy;
++    s32 i;
++
++    for(i = 0; i < SHRINE_MAX_SLASHES; i++){
++        if(sShrineSlashes[i].life <= 0.0f)
++            break;
++    }
++    if(i == SHRINE_MAX_SLASHES)
++        return;
++
++    s = &sShrineSlashes[i];
++    cx = randf2(20.0f, 300.0f);
++    cy = randf2(20.0f, 220.0f);
++    len = randf2(90.0f, 220.0f);
++    ang = randf2(0.0f, 3.14159f);
++    dx = cosf(ang) * len * 0.5f;
++    dy = sinf(ang) * len * 0.5f;
++    s->x0 = cx - dx;
++    s->y0 = cy - dy;
++    s->x1 = cx + dx;
++    s->y1 = cy + dy;
++    s->width = randf2(1.0f, 2.5f);
++    s->life = randf2(0.12f, 0.22f);
++}
++
++static void __bsshrine_reset(void){
++    s32 i;
++
++    sShrineTimer = 0.0f;
++    sShrineHitTimer = 0.0f;
++    sShrineSfxTimer = 0.0f;
++    sShrineSlashSpawnTimer = 0.0f;
++    sShrineSweep = 0;
++    sShrineHitbox = HITBOX_0_NONE;
++    sShrineThunderPlayed = FALSE;
++    sShrineNamePlayed = FALSE;
++    for(i = 0; i < SHRINE_MAX_SLASHES; i++){
++        sShrineSlashes[i].life = 0.0f;
++    }
++}
++
++bool bsshrine_canStart(void){
++    return bsStoredState_getTransformation() == TRANSFORM_1_BANJO
++        && !player_inWater()
++        && !player_isSliding();
++}
++
++void bsshrine_init(void){
++    AnimCtrl *aCtrl = baanim_getAnimCtrlPtr();
++
++    __bsshrine_reset();
++    sShrineActive = TRUE;
++
++    anctrl_reset(aCtrl);
++    anctrl_setSmoothTransition(aCtrl, TRUE);
++    anctrl_setIndex(aCtrl, ASSET_4_ANIM_BSSHRINE);
++    anctrl_setDuration(aCtrl, SHRINE_DURATION);
++    anctrl_setPlaybackType(aCtrl, ANIMCTRL_ONCE);
++    anctrl_start(aCtrl, "bsshrine.c", 0x1);
++
++    yaw_setIdeal(func_8029B41C()); //face camera
++    code_14420_setUpdateTypes(1, YAW_STATE_1_DEFAULT, 3, BA_PHYSICS_NORMAL);
++    baphysics_set_target_horizontal_velocity(0.0f);
++
++    /* hush the level music for the domain */
++    midichannel_incOrDecCounter(FALSE);
++    func_8025A2FC(0, 0xfa0);
++
++    func_8029151C(0xC); //close-up camera, same as the jiggy dance
++    baMarker_collisionOff();
++    func_8030E58C(SFX_146_GRUNTY_SPELL_ATTACK_1, 0.6f);
++}
++
++void bsshrine_update(void){
++    enum bs_e next_state = 0;
++    f32 dt = time_getDelta();
++    s32 i;
++
++    yaw_setIdeal(func_8029B41C());
++    sShrineTimer += dt;
++
++    for(i = 0; i < SHRINE_MAX_SLASHES; i++){
++        if(sShrineSlashes[i].life > 0.0f)
++            sShrineSlashes[i].life -= dt;
++    }
++
++    if(!sShrineThunderPlayed && sShrineTimer >= SHRINE_TEXT1_START){
++        sShrineThunderPlayed = TRUE;
++        func_8030E58C(SFX_B5_THUNDERBOLT, 0.8f);
++        baMotor_80250D94(0.8f, 0.4f, 0.3f);
++    }
++
++    if(!sShrineNamePlayed && sShrineTimer >= SHRINE_TEXT2_START){
++        sShrineNamePlayed = TRUE;
++        func_8030E58C(SFX_B5_THUNDERBOLT, 0.55f);
++        func_8030E58C(SFX_A6_MAGICAL_FINISH, 0.6f);
++        baMotor_80250D94(1.0f, 0.6f, 0.6f);
++    }
++
++    if(SHRINE_TEXT1_START <= sShrineTimer && sShrineTimer < SHRINE_TEXT_END){
++        print_dialog(89, 52, "DOMAIN EXPANSION");
++    }
++    if(SHRINE_TEXT2_START <= sShrineTimer && sShrineTimer < SHRINE_TEXT_END){
++        print_bold_spaced(74, 164, "MALEVOLENT");
++        print_bold_spaced(112, 190, "SHRINE");
++    }
++
++    if(SHRINE_SLASH_START <= sShrineTimer && sShrineTimer < SHRINE_SLASH_END){
++        /* Dismantle & Cleave: everything in range gets cut, repeatedly */
++        sShrineHitTimer -= dt;
++        if(sShrineHitTimer <= 0.0f){
++            sShrineHitTimer = 0.3f;
++            __bsshrine_sweep();
++        }
++
++        sShrineSfxTimer -= dt;
++        if(sShrineSfxTimer <= 0.0f){
++            sShrineSfxTimer = randf2(0.07f, 0.16f);
++            func_8030E58C((randf2(0.0f, 1.0f) < 0.5f) ? SFX_2_CLAW_SWIPE : SFX_129_SWOOSH, randf2(0.9f, 1.5f));
++        }
++
++        sShrineSlashSpawnTimer -= dt;
++        if(sShrineSlashSpawnTimer <= 0.0f){
++            sShrineSlashSpawnTimer = randf2(0.01f, 0.035f);
++            __bsshrine_spawnSlash();
++        }
++    }
++
++    if(anctrl_isStopped(baanim_getAnimCtrlPtr()) || sShrineTimer >= SHRINE_DURATION + 0.5f)
++        next_state = BS_1_IDLE;
++
++    bs_setState(next_state);
++}
++
++void bsshrine_end(void){
++    sShrineActive = FALSE;
++    __bsshrine_reset();
++    func_80291548();
++    func_8025A2FC(-1, 0xfa0);
++    midichannel_incOrDecCounter(TRUE);
++    baMarker_collisionOn();
++}
++
++void bsshrine_interrupt(void){
++    func_80296590();
++}
++
++/*
++ * Screen-space overlay, drawn after the 3D world and before the HUD.
++ * Coordinates: viewport_setRenderViewportAndOrthoMatrix maps x in [-2W, 2W]
++ * and y in [-2H, 2H], so one screen pixel is 4 units with the origin centred.
++ */
++static void __bsshrine_setVtx(Vtx *v, f32 px, f32 py, u8 r, u8 g, u8 b, u8 a){
++    v->v.ob[0] = (s16)((px - gFramebufferWidth * 0.5f) * 4.0f);
++    v->v.ob[1] = (s16)((gFramebufferHeight * 0.5f - py) * 4.0f);
++    v->v.ob[2] = -5;
++    v->v.flag = 0;
++    v->v.tc[0] = 0;
++    v->v.tc[1] = 0;
++    v->v.cn[0] = r;
++    v->v.cn[1] = g;
++    v->v.cn[2] = b;
++    v->v.cn[3] = a;
++}
++
++/* Emits one quad (4 vertices, 2 triangles). Quads are batched 4 per vertex load. */
++static void __bsshrine_quad(Gfx **gfx, Vtx **vtx, f32 p[4][2], u8 r, u8 g, u8 b, u8 a){
++    Vtx *v = *vtx;
++    s32 i;
++
++    for(i = 0; i < 4; i++){
++        __bsshrine_setVtx(&v[i], p[i][0], p[i][1], r, g, b, a);
++    }
++    gSPVertex((*gfx)++, osVirtualToPhysical(v), 4, 0);
++    gSP2Triangles((*gfx)++, 0, 1, 2, 0, 0, 2, 3, 0);
++    *vtx = v + 4;
++}
++
++static void __bsshrine_rect(Gfx **gfx, Vtx **vtx, f32 x0, f32 y0, f32 x1, f32 y1, u8 r, u8 g, u8 b, u8 a){
++    f32 p[4][2];
++    p[0][0] = x0; p[0][1] = y0;
++    p[1][0] = x0; p[1][1] = y1;
++    p[2][0] = x1; p[2][1] = y1;
++    p[3][0] = x1; p[3][1] = y0;
++    __bsshrine_quad(gfx, vtx, p, r, g, b, a);
++}
++
++#ifdef SHRINE_TEST
++/* test builds only: surround Banjo with enemies shortly after boot (Grublins need Mumbo's Mountain) */
++#ifndef SHRINE_TEST_ACTOR
++#define SHRINE_TEST_ACTOR ACTOR_6_GRUBLIN
++#endif
++static s32 sShrineTestFrames;
++static void __bsshrine_testSpawn(void){
++    f32 pos[3];
++    f32 p[3];
++    s32 i;
++
++    if(++sShrineTestFrames != 120)
++        return;
++    playerPosition_get(pos);
++    for(i = 0; i < 6; i++){
++        p[0] = pos[0] + cosf(i * 1.047f) * 400.0f;
++        p[1] = pos[1];
++        p[2] = pos[2] + sinf(i * 1.047f) * 400.0f;
++        __spawnQueue_add_4((GenFunction_4)spawnQueue_actor_f32, SHRINE_TEST_ACTOR, reinterpret_cast(s32, p[0]), reinterpret_cast(s32, p[1]), reinterpret_cast(s32, p[2]));
++    }
++}
++#endif
++
++void bsshrine_draw(Gfx **gfx, Mtx **mtx, Vtx **vtx){
++    f32 k;
++    f32 w, h;
++    f32 p[4][2];
++    f32 nx, ny, len, t;
++    u8 a;
++    s32 i;
++
++#ifdef SHRINE_TEST
++    {
++        static char buf[24];
++        __bsshrine_testSpawn();
++        bk_strcpy(buf, "ALIVE ");
++        bk_strIToA(buf + 6, actorArray_actorCount(SHRINE_TEST_ACTOR));
++        print_dialog(20, 40, buf);
++    }
++#endif
++    k = __bsshrine_intensity();
++    if(k <= 0.0f)
++        return;
++
++    w = (f32)gFramebufferWidth;
++    h = (f32)gFramebufferHeight;
++
++    viewport_setRenderViewportAndOrthoMatrix(gfx, mtx);
++    gDPPipeSync((*gfx)++);
++    gSPClearGeometryMode((*gfx)++, G_ZBUFFER | G_CULL_BOTH | G_FOG | G_LIGHTING | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR | G_LOD);
++    gSPSetGeometryMode((*gfx)++, G_SHADE | G_SHADING_SMOOTH);
++    gSPTexture((*gfx)++, 0, 0, 0, G_TX_RENDERTILE, G_OFF);
++    gDPSetCycleType((*gfx)++, G_CYC_1CYCLE);
++    gDPSetCombineMode((*gfx)++, G_CC_SHADE, G_CC_SHADE);
++    gDPSetRenderMode((*gfx)++, G_RM_XLU_SURF, G_RM_XLU_SURF2);
++
++    /* blood-red wash over the whole domain */
++    __bsshrine_rect(gfx, vtx, 0.0f, 0.0f, w, h, 0x70, 0x00, 0x08, (u8)(k * 110.0f));
++
++    /* the shrine closing in: black cinematic bars */
++    t = k * 26.0f;
++    __bsshrine_rect(gfx, vtx, 0.0f, 0.0f, w, t, 0x00, 0x00, 0x00, 0xE0);
++    __bsshrine_rect(gfx, vtx, 0.0f, h - t, w, h, 0x00, 0x00, 0x00, 0xE0);
++
++    /* shrine roof: a dark sweeping eave with upturned corners across the top */
++    a = (u8)(k * 200.0f);
++    p[0][0] = -10.0f;      p[0][1] = t + 6.0f;
++    p[1][0] = 40.0f;       p[1][1] = t + 22.0f;
++    p[2][0] = w - 40.0f;   p[2][1] = t + 22.0f;
++    p[3][0] = w + 10.0f;   p[3][1] = t + 6.0f;
++    __bsshrine_quad(gfx, vtx, p, 0x20, 0x00, 0x02, a);
++    p[0][0] = -10.0f;      p[0][1] = t;
++    p[1][0] = -10.0f;      p[1][1] = t + 6.0f;
++    p[2][0] = w + 10.0f;   p[2][1] = t + 6.0f;
++    p[3][0] = w + 10.0f;   p[3][1] = t;
++    __bsshrine_quad(gfx, vtx, p, 0x20, 0x00, 0x02, a);
++
++    /* shrine pillars at the screen edges */
++    __bsshrine_rect(gfx, vtx, 6.0f, t + 20.0f, 20.0f, h - t, 0x38, 0x02, 0x04, a);
++    __bsshrine_rect(gfx, vtx, w - 20.0f, t + 20.0f, w - 6.0f, h - t, 0x38, 0x02, 0x04, a);
++
++    /* Dismantle / Cleave slash streaks */
++    for(i = 0; i < SHRINE_MAX_SLASHES; i++){
++        ShrineSlash *s = &sShrineSlashes[i];
++        if(s->life <= 0.0f)
++            continue;
++        nx = -(s->y1 - s->y0);
++        ny = s->x1 - s->x0;
++        len = sqrtf(nx * nx + ny * ny);
++        if(len < 1.0f)
++            continue;
++        nx = nx / len * s->width;
++        ny = ny / len * s->width;
++        /* red glow */
++        p[0][0] = s->x0 - nx * 2.5f; p[0][1] = s->y0 - ny * 2.5f;
++        p[1][0] = s->x0 + nx * 2.5f; p[1][1] = s->y0 + ny * 2.5f;
++        p[2][0] = s->x1 + nx * 2.5f; p[2][1] = s->y1 + ny * 2.5f;
++        p[3][0] = s->x1 - nx * 2.5f; p[3][1] = s->y1 - ny * 2.5f;
++        __bsshrine_quad(gfx, vtx, p, 0xFF, 0x10, 0x20, 0x90);
++        /* white-hot core */
++        p[0][0] = s->x0 - nx; p[0][1] = s->y0 - ny;
++        p[1][0] = s->x0 + nx; p[1][1] = s->y0 + ny;
++        p[2][0] = s->x1 + nx; p[2][1] = s->y1 + ny;
++        p[3][0] = s->x1 - nx; p[3][1] = s->y1 - ny;
++        __bsshrine_quad(gfx, vtx, p, 0xFF, 0xF0, 0xF0, 0xF0);
++    }
++
++    gDPPipeSync((*gfx)++);
++    gSPSetGeometryMode((*gfx)++, G_ZBUFFER);
++    viewport_setRenderViewportAndPerspectiveMatrix(gfx, mtx);
++}
+diff --git a/src/core2/bs/stand.c b/src/core2/bs/stand.c
+index 894dffd..edd2819 100644
+--- a/src/core2/bs/stand.c
++++ b/src/core2/bs/stand.c
+@@ -73,6 +73,10 @@ s32 func_802B488C(s32 arg0){
+     if(bakey_pressed(BUTTON_A))
+         retVal = bs_getTypeOfJump();
+ 
++    // mod: Domain Expansion - Malevolent Shrine
++    if(bakey_pressed(BUTTON_L) && bsshrine_canStart())
++        retVal = BS_A6_MALEVOLENT_SHRINE;
++
+     if(bainput_should_look_first_person_camera())
+         retVal = badrone_look();
+ 
+diff --git a/src/core2/bs/walk.c b/src/core2/bs/walk.c
+index e2540c5..24c7728 100644
+--- a/src/core2/bs/walk.c
++++ b/src/core2/bs/walk.c
+@@ -103,6 +103,10 @@ s32 func_802B6F20(s32 arg0){
+                 arg0 = BS_6_CLAW;
+         }
+     }
++
++    // mod: Domain Expansion - Malevolent Shrine
++    if(bakey_pressed(BUTTON_L) && bsshrine_canStart())
++        arg0 = BS_A6_MALEVOLENT_SHRINE;
+     return arg0;
+ }
+ 
+diff --git a/src/core2/bsList.c b/src/core2/bsList.c
+index 94103f6..540313e 100644
+--- a/src/core2/bsList.c
++++ b/src/core2/bsList.c
+@@ -6,7 +6,7 @@
+ 
+ 
+ //TODO replace with bsList Count
+-bsState D_8037C700[166];
++bsState D_8037C700[167];
+ 
+ /* .code */
+ void bsList_clearAll(void){
+@@ -17,7 +17,7 @@ void bsList_clearAll(void){
+         bsList_setEndMethod(i, NULL);
+         bsList_setInterruptMethod(i, NULL);
+         i++;
+-    }while(i != 0xa6);
++    }while(i != 0xa7);
+ }
+ 
+ void bsList_setInitMethod(enum bs_e i, bsStateMethod func){
+diff --git a/src/core2/bsmethods.c b/src/core2/bsmethods.c
+index 78ff22b..f8ef1a3 100644
+--- a/src/core2/bsmethods.c
++++ b/src/core2/bsmethods.c
+@@ -165,6 +165,7 @@ bsMap bsMethodsTable[] = {
+     {BS_A3_BEE_BOUNCE,             bsbeemain_bounce_init,         bsbeemain_bounce_update,       bsbeemain_bounce_end,          func_80296590},
+     {BS_A4_WONDERWING_DRONE,       bsbwhirl_drone_init,           bsbwhirl_drone_update,         bsbwhirl_drone_end,            func_80296608},
+     {BS_A5_WONDERWING_UNKA5,       bsbwhirl_bsA5unknown_init,     bsbwhirl_bsA5unknown_update,   bsbwhirl_bsA5unknown_end,      func_80296608},
++    {BS_A6_MALEVOLENT_SHRINE,      bsshrine_init,                 bsshrine_update,               bsshrine_end,                  bsshrine_interrupt}, // mod
+     {0}
+ };
+ 
+diff --git a/src/core2/code_5C870.c b/src/core2/code_5C870.c
+index 411af64..cf7f9a8 100644
+--- a/src/core2/code_5C870.c
++++ b/src/core2/code_5C870.c
+@@ -137,6 +137,8 @@ void func_802E39D0(Gfx **gfx, Mtx **mtx, Vtx **vtx, s32 framebuffer_idx, bool ar
+         picturebox_resetScissorBoxAndFramebuffer(gfx, mtx, vtx);
+     }
+ 
++    bsshrine_draw(gfx, mtx, vtx); // mod: Domain Expansion - Malevolent Shrine
++
+     if (!game_is_frozen() && gsworld_getEnableDraw()) {
+         core2_A5BC0_drawScreenOverlayMarkers(gfx, mtx, vtx);
+     }
+diff --git a/src/core2/code_6B30.c b/src/core2/code_6B30.c
+index fc37599..04b618b 100644
+--- a/src/core2/code_6B30.c
++++ b/src/core2/code_6B30.c
+@@ -71,6 +71,9 @@ enum hitbox_e hitbox_getHitboxForActor(ActorMarker *arg0){
+         case BS_31_ROLL:
+             return __maybe(bstwirl_hitboxActive(),HITBOX_7_ROLL);
+             break;
++        case BS_A6_MALEVOLENT_SHRINE: // mod: Domain Expansion slashes
++            return bsshrine_getHitbox();
++
+         case BS_6E_CROC_BITE://L8028DCBC
+             return __maybe(bscroc_hitboxActive(),HITBOX_9_CROC_BITE);
+             break;
+diff --git a/src/core2/code_7060.c b/src/core2/code_7060.c
+index e2803c3..5dc31b8 100644
+--- a/src/core2/code_7060.c
++++ b/src/core2/code_7060.c
+@@ -478,6 +478,7 @@ enum bsgroup_e player_movementGroup(void) {
+         case BS_3F_UNKNOWN: //L8028EE00
+         case BS_41_DIE: //L8028EE00
+         case BS_44_JIG_JIGGY: //L8028EE00
++        case BS_A6_MALEVOLENT_SHRINE: // mod
+             return BSGROUP_1_INTR;
+ 
+         case BS_1A_WONDERWING_ENTER: //L8028EE08
