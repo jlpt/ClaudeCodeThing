@@ -46,7 +46,17 @@ for before, line in entries:
 open(p, "w").write(s)
 PY
 
-# 3. build with the anti-tamper/anti-piracy checks compiled out (they fight modified code)
+# 3. turn Banjo's player models (0x34E high poly, 0x34D low poly) into Sukuna.
+#    The originals are kept as *.orig so re-running always starts from the real models.
+PY="$DECOMP/.venv/bin/python3"
+"$PY" -c "import numpy" 2>/dev/null || "$PY" -m pip install -q numpy
+for id in 034E 034D; do
+    f="assets/model/$id.model.bin"
+    [ -f "$f.orig" ] || cp "$f" "$f.orig"
+    "$PY" "$HERE/../tools/sukuna.py" "$f.orig" "$f"
+done
+
+# 4. build with the anti-tamper/anti-piracy checks compiled out (they fight modified code)
 grep -rl "ANTI_TAMPER\|ANTI_PIRACY" src | xargs touch
 touch src/core2/bs/jig.c
 PATH="$DECOMP/.venv/bin:$PATH" make -j"$(nproc)" ANTI_TAMPER=0 ANTI_PIRACY=0

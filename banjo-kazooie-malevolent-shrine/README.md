@@ -1,9 +1,25 @@
 # Banjo-Kazooie: Domain Expansion – Malevolent Shrine
 
-A Banjo-Kazooie ROM hack that lets Banjo use Sukuna's Domain Expansion from *Jujutsu Kaisen*.
+A Banjo-Kazooie ROM hack that turns Banjo into Sukuna from *Jujutsu Kaisen* and lets him use
+Domain Expansion: Malevolent Shrine.
 It's built on the [n64decomp/banjo-kazooie](https://github.com/n64decomp/banjo-kazooie) decompilation.
 
 ![malevolent shrine](screenshots/2-malevolent-shrine.png)
+
+## Sukuna-Banjo
+
+Banjo's player model is converted into Sukuna:
+
+* **Face:** the bear snout is flattened into a human face with a small nose, and the bear ears are tucked away.
+  He has red eyes, Sukuna's second pair of eyes under them, black cheek stripes, a forehead mark and a toothy grin.
+* **Hair:** pink and spiky, swept up and back. It's new geometry attached to his head bone, so it moves with him.
+* **Markings:** jagged marks on the chest, lines down the stomach, two black bands on each upper arm and one on each wrist.
+* **Outfit:** skin-toned instead of fur, dark-blue jeans for the yellow shorts, a brown belt, and red sneakers for his feet.
+
+Both player models are converted (the low-poly one used in the big levels and the high-poly one used in
+smaller areas), at every level of detail. Kazooie is unchanged.
+
+![Sukuna model](screenshots/sukuna-model-preview.png)
 
 ## In game
 
@@ -33,7 +49,7 @@ Press **L** while standing or walking as Banjo. It doesn't work when transformed
 | | SHA-1 |
 |---|---|
 | original ROM (`.z64`, big-endian) | `1fe1632098865f639e22c11b9a81ee8f29c75d7a` |
-| patched ROM | `1b36dc357b42628747c4b6d78976d03c4090b06b` |
+| patched ROM | `00fb00dcf0e209ad4f4cf42b958bf38aa7f0b03b` |
 
 Use any BPS patcher, such as [Floating IPS](https://www.smwcentral.net/?p=section&a=details&id=11474)
 or [Rom Patcher JS](https://www.marcrobledo.com/RomPatcher.js/), then play the result in an emulator.
@@ -41,7 +57,8 @@ No ROMs are included in this repository.
 
 ## Building from source
 
-The mod is a small patch to the decomp plus two new assets: the animation and the shrine model.
+The mod is a small patch to the decomp, two new assets (the animation and the shrine model), and a
+conversion of Banjo's own models, which the install script runs on your extracted game files.
 
 ```sh
 git clone --recursive https://github.com/n64decomp/banjo-kazooie   # tested at e8d31fa5
@@ -51,7 +68,8 @@ cd banjo-kazooie
 ```
 
 `apply_mod.sh` applies `decomp/malevolent-shrine.patch` and puts the new assets in unused slots of
-the asset table: animation `0x0004` and model `0x02D8`. It then rebuilds with `ANTI_TAMPER=0 ANTI_PIRACY=0`,
+the asset table: animation `0x0004` and model `0x02D8`. It converts Banjo's models `0x34E` and `0x34D`
+with `tools/sukuna.py`, keeping the originals as `*.orig` (it installs `numpy` into the decomp's `.venv` if needed). It then rebuilds with `ANTI_TAMPER=0 ANTI_PIRACY=0`,
 because the game's anti-tamper checks otherwise misbehave on modified code. On a fresh clone it
 reproduces the patched ROM's SHA-1 exactly.
 
@@ -84,6 +102,13 @@ the black bars.
 ## Tools
 
 `tools/` holds the Python that produced the new assets:
+
+* `sukuna.py` converts Banjo's models into Sukuna. It recolors vertex colors and texture palettes, and
+  reshapes the head vertices (the snout lives on its own bone, so it is squashed back to the face and its pivot moved).
+  It adds hair spikes, arm bands and markings as new display lists hooked into each level of detail under the right bone.
+  Markings are drawn in a flat front view and projected onto the mesh by ray casting.
+* `bkmodel.py` reads models: textures, display lists, vertices and the geometry command tree (including the
+  three levels of detail). `render2.py` is a depth-buffered, textured software renderer used to preview the changes.
 
 * `make_shrine.py` builds the shrine model (temple, maw, pillars, roofs, horns, skull mound) and writes it in
   Banjo-Kazooie's model format: header, empty texture list, display list, vertex list and one geometry command.
@@ -125,6 +150,8 @@ Results:
 * The shrine is a backdrop: it covers the scenery behind Banjo, but characters and effects drawn after
   him (enemies, some NPCs) appear in front of it even when they are actually behind it.
 * In tight spaces the pulled-back camera can end up against walls.
+* A few cutscenes use separate Banjo models (for example, Banjo asleep in bed in the intro), so he is still a bear there.
+* Sukuna-Banjo is still built on Banjo's skeleton, so he keeps Banjo's proportions and round head.
 * It hits anything the game treats as attackable within range, including things a Beak Bomb or
   Beak Buster would break. Bosses and scripted enemies may react oddly.
 * There is no cooldown or cost, so it can be used as often as you like.
