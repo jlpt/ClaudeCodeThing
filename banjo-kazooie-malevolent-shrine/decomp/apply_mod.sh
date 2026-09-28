@@ -25,18 +25,25 @@ else
     echo "source patch does not apply cleanly to this checkout"; exit 1
 fi
 
-# 2. the new hand-sign animation as asset 0x0004 (an empty slot in the asset table)
+# 2. new assets in empty slots of the asset table:
+#    0x0004 = the hand-sign animation, 0x02D8 = the shrine model
 cp "$HERE/assets/anim/0004.anim.bin" assets/anim/0004.anim.bin
+cp "$HERE/assets/model/02D8.model.bin" assets/model/02D8.model.bin
 python3 - <<'PY'
 p = "assets/assets.yaml"
 s = open(p).read()
-line4 = '  - {uid: 0x0004, type: Animation, compressed: true , flags: 0x0003, relative_path: "anim/0004.anim.bin"}\n'
-line3 = '  - {uid: 0x0003, type: Animation, compressed: true , flags: 0x0003, relative_path: "anim/0003.anim.bin"}\n'
-if line4 not in s:
-    assert line3 in s, "unexpected assets.yaml layout"
-    s = s.replace(line3, line3 + line4)
-    open(p, "w").write(s)
-    print("registered anim 0x0004 in assets.yaml")
+entries = [
+    ('  - {uid: 0x0003, type: Animation, compressed: true , flags: 0x0003, relative_path: "anim/0003.anim.bin"}\n',
+     '  - {uid: 0x0004, type: Animation, compressed: true , flags: 0x0003, relative_path: "anim/0004.anim.bin"}\n'),
+    ('  - {uid: 0x02D7, type: Model , compressed: true , flags: 0x0000, relative_path: "model/02D7.model.bin"}\n',
+     '  - {uid: 0x02D8, type: Model , compressed: true , flags: 0x0000, relative_path: "model/02D8.model.bin"}\n'),
+]
+for before, line in entries:
+    if line not in s:
+        assert before in s, "unexpected assets.yaml layout"
+        s = s.replace(before, before + line)
+        print("registered", line.split(",")[0].strip())
+open(p, "w").write(s)
 PY
 
 # 3. build with the anti-tamper/anti-piracy checks compiled out (they fight modified code)

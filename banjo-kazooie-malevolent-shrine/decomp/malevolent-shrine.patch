@@ -16,7 +16,7 @@ index 6d29b42..360c3bc 100644
  void bsjig_jiggy_end(void);
  void bsjig_jiggy_interrupt(void);
 diff --git a/include/enums.h b/include/enums.h
-index a6c2e9d..daf627a 100644
+index a6c2e9d..5cbf508 100644
 --- a/include/enums.h
 +++ b/include/enums.h
 @@ -2634,7 +2634,8 @@ enum bs_e {
@@ -38,11 +38,20 @@ index a6c2e9d..daf627a 100644
      ASSET_5_ANIM_BSPUNCH,
      /*stub*/ ASSET_6_ANIM_stub,
      ASSET_7_ANIM_BSBTROT_EXIT,
+@@ -3565,7 +3566,7 @@ enum asset_e
+     // 2d5 FP Blue Present
+     // 2d6 FP Tartan Present
+     // 2d7 FP Green/White Present
+-    // Unused
++    ASSET_2D8_MODEL_MALEVOLENT_SHRINE = 0x2D8, // mod: Domain Expansion shrine
+     // Unused
+     // 2da TTC Palm Tree
+     // 2db RBB Grey Toxic Barrel
 diff --git a/include/functions.h b/include/functions.h
-index bdc077b..0db9d76 100644
+index bdc077b..3ac315a 100644
 --- a/include/functions.h
 +++ b/include/functions.h
-@@ -483,4 +483,9 @@ void bkmemcpy64(void *dest, void *src, s32 size); // handwritten assembly code t
+@@ -483,4 +483,12 @@ void bkmemcpy64(void *dest, void *src, s32 size); // handwritten assembly code t
  void bkmemset64(void *dest, s32 value, s32 size); // handwritten assembly code that performs an optimized 8 byte memset
  u32 bkGetSR(void); // handwritten assembly code that replicates the __osGetSR function
  
@@ -50,8 +59,24 @@ index bdc077b..0db9d76 100644
 +bool bsshrine_canStart(void);
 +s32 bsshrine_getHitbox(void);
 +void bsshrine_draw(Gfx **gfx, Mtx **mtx, Vtx **vtx);
++void bsshrine_drawShrine(Gfx **gfx, Mtx **mtx, Vtx **vtx);
++void func_802BFF80(f32 distance); // ncDynamicCamC: jiggy close-up camera distance
++void ncDynamicCamC_setLookHeight(f32 height);
 +
  #endif
+diff --git a/src/core2/ba/model.c b/src/core2/ba/model.c
+index 5e13d90..1b7da67 100644
+--- a/src/core2/ba/model.c
++++ b/src/core2/ba/model.c
+@@ -72,6 +72,8 @@ void baModel_draw(Gfx **gfx, Mtx **mtx, Vtx **vtx){
+     f32 plyr_pos[3]; //sp44
+     f32 sp38[3];
+ 
++    bsshrine_drawShrine(gfx, mtx, vtx); // mod: Malevolent Shrine backdrop, drawn before Banjo
++
+     if(!baModelIsVisible)
+         return;
+ 
 diff --git a/src/core2/bs/jig.c b/src/core2/bs/jig.c
 index 54a249d..d2f642d 100644
 --- a/src/core2/bs/jig.c
@@ -64,23 +89,26 @@ index 54a249d..d2f642d 100644
 +#include "malevolent_shrine.inc"
 diff --git a/src/core2/bs/malevolent_shrine.inc b/src/core2/bs/malevolent_shrine.inc
 new file mode 100644
-index 0000000..c5bd412
+index 0000000..9a12ead
 --- /dev/null
 +++ b/src/core2/bs/malevolent_shrine.inc
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,495 @@
 +/*
 + * Mod: "Domain Expansion: Malevolent Shrine" (Jujutsu Kaisen).
 + *
 + * Press L while standing or walking on the ground as Banjo. Banjo turns to the
-+ * camera, makes the hand sign (ASSET_4_ANIM_BSSHRINE), the screen closes in
-+ * with a blood-red shrine frame, and every enemy within range is slashed to
-+ * pieces for a few seconds.
++ * camera, makes the hand sign (ASSET_4_ANIM_BSSHRINE), the shrine
++ * (ASSET_2D8_MODEL_MALEVOLENT_SHRINE) rises up behind him, the screen turns
++ * blood red, and every enemy within range is slashed to pieces for a few
++ * seconds. The shrine fades away when the domain ends.
 + *
 + * Included at the end of bs/jig.c so it lives in the core2 overlay without
 + * changing the splat segment layout.
 + */
 +
 +#include "time.h"
++#include "core1/viewport.h"
++#include "core2/modelRender.h"
 +
 +#define SHRINE_DURATION        7.0f
 +#define SHRINE_TEXT1_START     0.9f
@@ -91,6 +119,21 @@ index 0000000..c5bd412
 +#define SHRINE_FADE_END        6.5f
 +#define SHRINE_RADIUS          2500.0f
 +#define SHRINE_MAX_SLASHES     12
++#define SHRINE_BAR_HEIGHT      30.0f
++#define SHRINE_MODEL_APPEAR    1.8f    /* shrine starts rising behind Banjo */
++#define SHRINE_MODEL_RISE      0.7f    /* seconds to rise and fade in */
++/* Framing: after the hand sign the close-up camera pulls back from 290 to 1100 units and aims
++ * 260 above Banjo, so the whole shrine fits between the letterbox bars with Banjo in front. */
++#define SHRINE_CAMERA_ZOOM_START 1.8f
++#define SHRINE_CAMERA_ZOOM_TIME  0.9f
++#define SHRINE_CAMERA_NEAR       290.0f   /* vanilla jiggy close-up distance */
++#define SHRINE_CAMERA_FAR        1100.0f
++#define SHRINE_CAMERA_LOOK_NEAR  100.0f   /* vanilla look-at height */
++#define SHRINE_CAMERA_LOOK_FAR   260.0f
++#define SHRINE_MODEL_DISTANCE  1600.0f /* how far behind Banjo it stands */
++#define SHRINE_MODEL_DROP      350.0f  /* base below Banjo's feet */
++#define SHRINE_MODEL_SCALE     1.5f
++#define SHRINE_MODEL_DEPTH     600.0f  /* extra depth it rises up from */
 +
 +typedef struct {
 +    f32 x0, y0, x1, y1; /* screen pixels */
@@ -109,6 +152,10 @@ index 0000000..c5bd412
 +static u8  sShrineThunderPlayed;
 +static u8  sShrineNamePlayed;
 +static ShrineSlash sShrineSlashes[SHRINE_MAX_SLASHES];
++static BKModelBin *sShrineModel;
++static u8  sShrinePlaced;
++static f32 sShrinePosition[3];
++static f32 sShrineYaw;
 +
 +/* .code */
 +static f32 __bsshrine_clamp01(f32 v){
@@ -118,8 +165,13 @@ index 0000000..c5bd412
 +}
 +
 +/* 0..1 strength of the domain's screen effect for the current timer value */
++/* only draw while Banjo is really in the domain state (guards against stale data) */
++static int __bsshrine_isRunning(void){
++    return sShrineActive && bs_getState() == BS_A6_MALEVOLENT_SHRINE;
++}
++
 +static f32 __bsshrine_intensity(void){
-+    if(!sShrineActive)
++    if(!__bsshrine_isRunning())
 +        return 0.0f;
 +    if(sShrineTimer < SHRINE_TEXT2_START)
 +        return __bsshrine_clamp01(sShrineTimer / SHRINE_TEXT2_START) * 0.6f;
@@ -205,11 +257,45 @@ index 0000000..c5bd412
 +        && !player_isSliding();
 +}
 +
++/* Stand the shrine behind Banjo, on the far side from the camera, facing the camera. */
++static void __bsshrine_placeModel(void){
++    f32 player_position[3];
++    f32 camera_position[3];
++    f32 dx, dz, len;
++
++    playerPosition_get(player_position);
++    viewport_getPosition_vec3f(camera_position);
++    dx = player_position[0] - camera_position[0];
++    dz = player_position[2] - camera_position[2];
++    len = sqrtf(dx * dx + dz * dz);
++    if(len < 1.0f){
++        dx = 0.0f; dz = -1.0f; len = 1.0f;
++    }
++    dx /= len;
++    dz /= len;
++    sShrinePosition[0] = player_position[0] + dx * SHRINE_MODEL_DISTANCE;
++    sShrinePosition[1] = player_position[1] - SHRINE_MODEL_DROP;
++    sShrinePosition[2] = player_position[2] + dz * SHRINE_MODEL_DISTANCE;
++    /* face the camera, the same way Banjo is turned (both are drawn by modelRender_draw) */
++    sShrineYaw = func_8029B41C();
++    sShrinePlaced = TRUE;
++}
++
++static void __bsshrine_freeModel(void){
++    if(sShrineModel != NULL){
++        assetcache_release(sShrineModel);
++        sShrineModel = NULL;
++    }
++    sShrinePlaced = FALSE;
++}
++
 +void bsshrine_init(void){
 +    AnimCtrl *aCtrl = baanim_getAnimCtrlPtr();
 +
 +    __bsshrine_reset();
 +    sShrineActive = TRUE;
++    sShrinePlaced = FALSE;
++    sShrineModel = assetcache_get(ASSET_2D8_MODEL_MALEVOLENT_SHRINE); // released in bsshrine_end
 +
 +    anctrl_reset(aCtrl);
 +    anctrl_setSmoothTransition(aCtrl, TRUE);
@@ -250,6 +336,20 @@ index 0000000..c5bd412
 +        baMotor_80250D94(0.8f, 0.4f, 0.3f);
 +    }
 +
++    if(sShrineTimer >= SHRINE_CAMERA_ZOOM_START){
++        /* pull the camera back to reveal the shrine */
++        f32 z = __bsshrine_clamp01((sShrineTimer - SHRINE_CAMERA_ZOOM_START) / SHRINE_CAMERA_ZOOM_TIME);
++        z = z * z * (3.0f - 2.0f * z);
++        func_802BFF80(SHRINE_CAMERA_NEAR + (SHRINE_CAMERA_FAR - SHRINE_CAMERA_NEAR) * z);
++        ncDynamicCamC_setLookHeight(SHRINE_CAMERA_LOOK_NEAR + (SHRINE_CAMERA_LOOK_FAR - SHRINE_CAMERA_LOOK_NEAR) * z);
++    }
++
++    if(!sShrinePlaced && sShrineTimer >= SHRINE_MODEL_APPEAR){
++        __bsshrine_placeModel();
++        func_8030E58C(SFX_1B_EXPLOSION_1, 0.5f);
++        baMotor_80250D94(0.6f, 0.5f, 0.5f);
++    }
++
 +    if(!sShrineNamePlayed && sShrineTimer >= SHRINE_TEXT2_START){
 +        sShrineNamePlayed = TRUE;
 +        func_8030E58C(SFX_B5_THUNDERBOLT, 0.55f);
@@ -258,11 +358,10 @@ index 0000000..c5bd412
 +    }
 +
 +    if(SHRINE_TEXT1_START <= sShrineTimer && sShrineTimer < SHRINE_TEXT_END){
-+        print_dialog(89, 52, "DOMAIN EXPANSION");
++        print_dialog(89, 15, "DOMAIN EXPANSION");      /* in the top letterbox bar */
 +    }
 +    if(SHRINE_TEXT2_START <= sShrineTimer && sShrineTimer < SHRINE_TEXT_END){
-+        print_bold_spaced(74, 164, "MALEVOLENT");
-+        print_bold_spaced(112, 190, "SHRINE");
++        print_bold_overlapping(36, 203, 0.8f, "MALEVOLENT SHRINE"); /* in the bottom bar */
 +    }
 +
 +    if(SHRINE_SLASH_START <= sShrineTimer && sShrineTimer < SHRINE_SLASH_END){
@@ -295,6 +394,7 @@ index 0000000..c5bd412
 +void bsshrine_end(void){
 +    sShrineActive = FALSE;
 +    __bsshrine_reset();
++    __bsshrine_freeModel();
 +    func_80291548();
 +    func_8025A2FC(-1, 0xfa0);
 +    midichannel_incOrDecCounter(TRUE);
@@ -303,6 +403,40 @@ index 0000000..c5bd412
 +
 +void bsshrine_interrupt(void){
 +    func_80296590();
++}
++
++/*
++ * The shrine is drawn from baModel_draw just before Banjo, after the level's
++ * opaque geometry, with depth testing off: it paints over the scenery like a
++ * backdrop (the domain replaces the surroundings) and Banjo is drawn on top.
++ */
++void bsshrine_drawShrine(Gfx **gfx, Mtx **mtx, Vtx **vtx){
++    f32 t, rise, fade, ease;
++    f32 position[3];
++    f32 rotation[3];
++    s32 alpha;
++
++    if(!__bsshrine_isRunning() || !sShrinePlaced || sShrineModel == NULL)
++        return;
++
++    t = sShrineTimer - SHRINE_MODEL_APPEAR;
++    rise = __bsshrine_clamp01(t / SHRINE_MODEL_RISE);
++    ease = 1.0f - (1.0f - rise) * (1.0f - rise);
++    fade = 1.0f - __bsshrine_clamp01((sShrineTimer - SHRINE_SLASH_END) / (SHRINE_FADE_END - SHRINE_SLASH_END));
++    alpha = (s32)(255.0f * __bsshrine_clamp01(rise * 1.6f) * fade);
++    if(alpha <= 0)
++        return;
++
++    position[0] = sShrinePosition[0];
++    position[1] = sShrinePosition[1] - (1.0f - ease) * SHRINE_MODEL_DEPTH;
++    position[2] = sShrinePosition[2];
++    rotation[0] = 0.0f;
++    rotation[1] = sShrineYaw;
++    rotation[2] = 0.0f;
++
++    modelRender_setDepthMode(MODEL_RENDER_DEPTH_NONE);
++    modelRender_setAlpha(alpha);
++    modelRender_draw(gfx, mtx, position, rotation, SHRINE_MODEL_SCALE * (0.85f + 0.15f * ease), NULL, sShrineModel);
 +}
 +
 +/*
@@ -383,6 +517,20 @@ index 0000000..c5bd412
 +        bk_strcpy(buf, "ALIVE ");
 +        bk_strIToA(buf + 6, actorArray_actorCount(SHRINE_TEST_ACTOR));
 +        print_dialog(20, 40, buf);
++        if(sShrineActive){
++            static char cbuf[40];
++            f32 pp[3], cp[3], rot[3];
++            playerPosition_get(pp);
++            viewport_getPosition_vec3f(cp);
++            viewport_getRotation_vec3f(rot);
++            bk_strcpy(cbuf, "D ");
++            bk_strIToA(cbuf + bk_strlen(cbuf), (s32)sqrtf((cp[0]-pp[0])*(cp[0]-pp[0]) + (cp[2]-pp[2])*(cp[2]-pp[2])));
++            bk_strcat(cbuf, " H ");
++            bk_strIToA(cbuf + bk_strlen(cbuf), (s32)(cp[1]-pp[1]));
++            bk_strcat(cbuf, " P ");
++            bk_strIToA(cbuf + bk_strlen(cbuf), (s32)rot[0]);
++            print_dialog(20, 200, cbuf);
++        }
 +    }
 +#endif
 +    k = __bsshrine_intensity();
@@ -404,27 +552,11 @@ index 0000000..c5bd412
 +    /* blood-red wash over the whole domain */
 +    __bsshrine_rect(gfx, vtx, 0.0f, 0.0f, w, h, 0x70, 0x00, 0x08, (u8)(k * 110.0f));
 +
-+    /* the shrine closing in: black cinematic bars */
-+    t = k * 26.0f;
++    /* black cinematic bars; the titles are printed inside them */
++    t = SHRINE_BAR_HEIGHT * __bsshrine_clamp01(sShrineTimer / 0.5f)
++        * (1.0f - __bsshrine_clamp01((sShrineTimer - SHRINE_SLASH_END) / (SHRINE_FADE_END - SHRINE_SLASH_END)));
 +    __bsshrine_rect(gfx, vtx, 0.0f, 0.0f, w, t, 0x00, 0x00, 0x00, 0xE0);
 +    __bsshrine_rect(gfx, vtx, 0.0f, h - t, w, h, 0x00, 0x00, 0x00, 0xE0);
-+
-+    /* shrine roof: a dark sweeping eave with upturned corners across the top */
-+    a = (u8)(k * 200.0f);
-+    p[0][0] = -10.0f;      p[0][1] = t + 6.0f;
-+    p[1][0] = 40.0f;       p[1][1] = t + 22.0f;
-+    p[2][0] = w - 40.0f;   p[2][1] = t + 22.0f;
-+    p[3][0] = w + 10.0f;   p[3][1] = t + 6.0f;
-+    __bsshrine_quad(gfx, vtx, p, 0x20, 0x00, 0x02, a);
-+    p[0][0] = -10.0f;      p[0][1] = t;
-+    p[1][0] = -10.0f;      p[1][1] = t + 6.0f;
-+    p[2][0] = w + 10.0f;   p[2][1] = t + 6.0f;
-+    p[3][0] = w + 10.0f;   p[3][1] = t;
-+    __bsshrine_quad(gfx, vtx, p, 0x20, 0x00, 0x02, a);
-+
-+    /* shrine pillars at the screen edges */
-+    __bsshrine_rect(gfx, vtx, 6.0f, t + 20.0f, 20.0f, h - t, 0x38, 0x02, 0x04, a);
-+    __bsshrine_rect(gfx, vtx, w - 20.0f, t + 20.0f, w - 6.0f, h - t, 0x38, 0x02, 0x04, a);
 +
 +    /* Dismantle / Cleave slash streaks */
 +    for(i = 0; i < SHRINE_MAX_SLASHES; i++){
@@ -559,3 +691,46 @@ index e2803c3..5dc31b8 100644
              return BSGROUP_1_INTR;
  
          case BS_1A_WONDERWING_ENTER: //L8028EE08
+diff --git a/src/core2/nc/dynamicCamC.c b/src/core2/nc/dynamicCamC.c
+index 2e23c2c..9ac3db3 100644
+--- a/src/core2/nc/dynamicCamC.c
++++ b/src/core2/nc/dynamicCamC.c
+@@ -9,6 +9,9 @@ struct {
+     f32 unk8;
+ }D_8037DB30;
+ 
++// mod: height the camera looks at above the player (vanilla 100, reset on init)
++f32 ncDynamicCamC_lookHeight;
++
+ /* .code */
+ void func_802BFED0(void){
+     f32 sp34;
+@@ -26,6 +29,7 @@ void ncDynamicCamC_init(void) {
+     func_802BE244(4.0f, 16.0f);
+     func_802BE230(1.8f, 14.0f);
+     D_8037DB30.unk0 = 290.0f;
++    ncDynamicCamC_lookHeight = 100.0f;
+     func_802BFED0();
+ }
+ 
+@@ -35,6 +39,11 @@ void func_802BFF80(f32 arg0){
+     D_8037DB30.unk0 = arg0;
+ }
+ 
++// mod: Domain Expansion pulls this camera back and tilts it up to show the shrine
++void ncDynamicCamC_setLookHeight(f32 height){
++    ncDynamicCamC_lookHeight = height;
++}
++
+ void ncDynamicCamC_update(void) {
+     f32 sp54[3];
+     f32 sp48[3];
+@@ -68,7 +77,7 @@ void ncDynamicCamC_update(void) {
+     }
+     ncDynamicCamera_getPosition(sp54);
+     player_getPosition(sp3C);
+-    sp3C[1] += 100.0f;
++    sp3C[1] += ncDynamicCamC_lookHeight;
+     ml_horizontal_and_vertical_angles(sp3C[0], sp3C[1], sp3C[2], sp54[0], sp54[1], sp54[2], &sp48[0], &sp48[1]);
+     sp48[0] = mlNormalizeAngle(-sp48[0]);
+     func_802BD904(sp48);
